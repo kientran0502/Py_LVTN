@@ -12,19 +12,58 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal
 import pyqtgraph as pg
 import numpy as np
+import time
 
 # ─── Palette (sáng hơn, dễ đọc) ──────────────────────────────────────────────
-BG_SURFACE  = "#141C2E"
-BG_CARD     = "#1A2340"
-BORDER      = "#2E4070"
-ACCENT_CYAN = "#18E4FF"
-ACCENT_TEAL = "#00FFB2"
-ACCENT_WARN = "#FFBE4A"
-ACCENT_ERR  = "#FF6B6B"
-ACCENT_PRP  = "#A78BFF"
-TEXT_PRIM   = "#FFFFFF"
-TEXT_SEC    = "#C8D8F0"
-TEXT_DIM    = "#7090B8"
+# BG_SURFACE  = "#141C2E"
+# BG_CARD     = "#1A2340"
+# BORDER      = "#2E4070"
+# ACCENT_CYAN = "#18E4FF"
+# ACCENT_TEAL = "#00FFB2"
+# ACCENT_WARN = "#FFBE4A"
+# ACCENT_ERR  = "#FF6B6B"
+# ACCENT_PRP  = "#A78BFF"
+# TEXT_PRIM   = "#FFFFFF"
+# TEXT_SEC    = "#C8D8F0"
+# TEXT_DIM    = "#7090B8"
+
+# BG_SURFACE  = "#F8FAFC"
+# BG_CARD     = "#FFFFFF"
+# BORDER      = "#CBD5E1"
+# ACCENT_CYAN = "#0284C8"
+# ACCENT_TEAL = "#0F766E"
+# ACCENT_WARN = "#D97706"
+# ACCENT_ERR  = "#DC2626"
+# ACCENT_PRP  = "#7C3AED"
+# TEXT_PRIM   = "#0F172A"
+# TEXT_SEC    = "#334155"
+# TEXT_DIM    = "#64748B"
+
+BG_SURFACE  = "#282A36"
+BG_CARD     = "#44475A"
+BORDER      = "#6272A4"
+ACCENT_CYAN = "#8BE9FD"
+ACCENT_TEAL = "#50FA7B"
+ACCENT_WARN = "#FFB86C"
+ACCENT_ERR  = "#FF5555"
+ACCENT_PRP  = "#BD93F9"
+TEXT_PRIM   = "#F8F8F2"
+TEXT_SEC    = "#D6D6D6"
+TEXT_DIM    = "#B0B0B0"
+
+# BG_SURFACE  = "#1A0F2E"
+# BG_CARD     = "#2A1B4A"
+# BORDER      = "#5B3FA8"
+# ACCENT_CYAN = "#00F5FF"
+# ACCENT_TEAL = "#00FFAA"
+# ACCENT_WARN = "#FFDD33"
+# ACCENT_ERR  = "#FF3366"
+# ACCENT_PRP  = "#BB77FF"
+# TEXT_PRIM   = "#FFFFFF"
+# TEXT_SEC    = "#E0CCFF"
+# TEXT_DIM    = "#A388E0"
+# ─── Font Size Global ─────────────────────────────────────
+FONT_BASE = 13      # ← CHỈNH SỐ NÀY (mặc định 13)
 
 STEP_COLORS = {
     "NONE": ("#1E2840", "#90A8C8"),
@@ -123,6 +162,14 @@ class WizardStateMachine(QObject):
 
 def create_temp_ctrl_tab(parent) -> QWidget:
     parent._wizard_sm = None
+    # Khởi tạo global_var an toàn
+    import global_var
+    for var in ['pid_pv_history', 'pid_time_history', 'pid_target_history',
+                'pid_target_history_time', 'pid_target_profile']:
+        if not hasattr(global_var, var):
+            setattr(global_var, var, [])
+    if not hasattr(global_var, 'pid_start_time'):
+        global_var.pid_start_time = None
 
     root = QScrollArea()
     root.setWidgetResizable(True)
@@ -186,7 +233,7 @@ def _build_pid_graph(parent) -> QGroupBox:
     pw.setFixedHeight(300)
     pw.showGrid(x=True, y=True, alpha=0.18)
     pw.setLabel("left",   "°C",     color=TEXT_SEC, size="10pt")
-    pw.setLabel("bottom", "sample", color=TEXT_SEC, size="10pt")
+    pw.setLabel("bottom", "Time (s)", color=TEXT_SEC, size="10pt")
     pw.getViewBox().setMouseEnabled(x=True, y=True)
 
     for name in ("left", "bottom"):
@@ -570,7 +617,7 @@ def _build_response_box(parent) -> QGroupBox:
             background-color:{BG_CARD}; border:1px solid {BORDER};
             border-radius:6px; color:{TEXT_SEC};
             font-family:"Cascadia Code","Consolas",monospace;
-            font-size:11px; padding:6px;
+            font-size:{FONT_BASE}px; padding:6px;
         }}
     """)
     hdr = QHBoxLayout()
@@ -591,56 +638,72 @@ def _build_response_box(parent) -> QGroupBox:
 def update_pid_display(parent):
     import global_var
     try:
-        if hasattr(parent, "pid_step_badge"):
-            parent.pid_step_badge.set_step(global_var.pid_step)
-        if hasattr(parent, "pid_card_sp"):
-            parent.pid_card_sp.set_value(global_var.pid_sp)
-        if hasattr(parent, "pid_card_pv"):
-            parent.pid_card_pv.set_value(global_var.pid_pv)
-        if hasattr(parent, "pid_card_out"):
-            parent.pid_card_out.set_value(global_var.pid_out)
-        if hasattr(parent, "pid_card_err"):
-            err    = global_var.pid_err
-            accent = ACCENT_ERR if abs(err) > 5.0 else ACCENT_WARN
-            parent.pid_card_err.set_value(err, accent_override=accent)
-
-        if hasattr(parent, "pid_curve_pv") and global_var.pid_pv_history:
-            n_samples = len(global_var.pid_pv_history)
-            xs = np.arange(n_samples, dtype=float)
-
-            # PV curve
+        # === PV ===
+        if hasattr(parent, "pid_curve_pv") and len(global_var.pid_pv_history) > 1:
             parent.pid_curve_pv.setData(
-                xs, np.array(global_var.pid_pv_history, dtype=float)
+                np.array(global_var.pid_time_history),
+                np.array(global_var.pid_pv_history)
             )
 
-            # TARGET: reveal 1 điểm từ lookup mỗi khi có sample PV mới
-            # Đường target kéo dài đúng theo thời gian thực
-            lookup = getattr(global_var, "pid_target_lookup", [])
-            if lookup:
-                n_target = len(global_var.pid_target_history)
-                while n_target < n_samples and n_target < len(lookup):
-                    global_var.pid_target_history.append(lookup[n_target])
-                    n_target += 1
+        # === TARGET - Vẽ bậc thang một lần ===
+        if hasattr(parent, "pid_curve_target") and global_var.pid_target_profile:
+            t_points = []
+            y_points = []
+            
+            for step in global_var.pid_target_profile:
+                t_points.extend([step["t0"], step["t1"] - 0.001])  # nhỏ để tạo bậc
+                y_points.extend([step["target"], step["target"]])
+            
+            parent.pid_curve_target.setData(np.array(t_points), np.array(y_points))
 
-            if global_var.pid_target_history:
-                xt = np.arange(len(global_var.pid_target_history), dtype=float)
-                parent.pid_curve_target.setData(
-                    xt, np.array(global_var.pid_target_history, dtype=float)
-                )
+        # Metric cards
+        if hasattr(parent, "pid_card_pv"):
+            parent.pid_card_pv.set_value(getattr(global_var, 'pid_pv', 0.0))
+        if hasattr(parent, "pid_card_sp"):
+            parent.pid_card_sp.set_value(getattr(global_var, 'pid_sp', 0.0))
+        if hasattr(parent, "pid_card_err"):
+            err = getattr(global_var, 'pid_err', 0.0)
+            accent = ACCENT_ERR if abs(err) > 5 else ACCENT_WARN
+            parent.pid_card_err.set_value(err, accent_override=accent)
+        if hasattr(parent, "pid_card_out"):
+            parent.pid_card_out.set_value(getattr(global_var, 'pid_out', 0.0))
+        if hasattr(parent, "pid_step_badge"):
+            parent.pid_step_badge.set_step(getattr(global_var, 'pid_step', "NONE"))
 
     except Exception as e:
-        print("PID display error:", e)
+        print("update_pid_display ERROR:", e)
 
+
+# def _clear_pid_history(parent):
+#     import global_var
+#     for lst in (global_var.pid_pv_history, global_var.pid_sp_history,
+#                 global_var.pid_err_history, global_var.pid_target_history):
+#         lst.clear()
+#     global_var.pid_target_lookup = []
+#     if hasattr(parent, "pid_curve_pv"):
+#         empty = np.array([], dtype=float)
+#         parent.pid_curve_pv.setData(empty, empty)
+#         parent.pid_curve_target.setData(empty, empty)
 
 def _clear_pid_history(parent):
     import global_var
-    for lst in (global_var.pid_pv_history, global_var.pid_sp_history,
-                global_var.pid_err_history, global_var.pid_target_history):
-        lst.clear()
-    global_var.pid_target_lookup = []
+    lists = ['pid_pv_history', 'pid_sp_history', 'pid_err_history',
+             'pid_time_history', 'pid_target_history', 'pid_target_history_time']
+    
+    for lst in lists:
+        if hasattr(global_var, lst):
+            setattr(global_var, lst, [])
+
+    if hasattr(global_var, 'pid_target_profile'):
+        global_var.pid_target_profile = []
+    if hasattr(global_var, 'pid_start_time'):
+        global_var.pid_start_time = None
+
+    # Clear graph
+    empty = np.array([], dtype=float)
     if hasattr(parent, "pid_curve_pv"):
-        empty = np.array([], dtype=float)
         parent.pid_curve_pv.setData(empty, empty)
+    if hasattr(parent, "pid_curve_target"):
         parent.pid_curve_target.setData(empty, empty)
 
 
@@ -662,26 +725,49 @@ def _clear_pid_history(parent):
 #   step[2]: stop=27°C, dur=60s  →  [27.0] * 60 samples
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# def build_target_profile(parent):
+#     """
+#     Gọi khi nhấn AUTO START.
+#     Tạo lookup table, reset history về rỗng.
+#     Target sẽ được reveal từng điểm theo sample PV thực tế nhận được.
+#     """
+#     import global_var
+
+#     global_var.pid_target_history.clear()
+
+#     lookup = []
+#     n = parent.wiz_step_count.value()
+#     for i in range(n):
+#         start_w, stop_w, dur_w, _ = parent._wiz_steps[i]
+#         stop_temp = stop_w.value()
+#         dur       = max(int(dur_w.value()), 1)
+#         lookup.extend([stop_temp] * dur)
+
+#     global_var.pid_target_lookup = lookup
+
 def build_target_profile(parent):
-    """
-    Gọi khi nhấn AUTO START.
-    Tạo lookup table, reset history về rỗng.
-    Target sẽ được reveal từng điểm theo sample PV thực tế nhận được.
-    """
     import global_var
-
-    global_var.pid_target_history.clear()
-
-    lookup = []
+    global_var.pid_target_profile = []
+    profile = []
     n = parent.wiz_step_count.value()
+    current_time = 0.0
+
     for i in range(n):
-        start_w, stop_w, dur_w, _ = parent._wiz_steps[i]
-        stop_temp = stop_w.value()
-        dur       = max(int(dur_w.value()), 1)
-        lookup.extend([stop_temp] * dur)
+        if i >= len(parent._wiz_steps):
+            break
+        _, stop_w, dur_w, _ = parent._wiz_steps[i]
+        duration = max(float(dur_w.value()), 0.1)
+        target_temp = round(stop_w.value(), 2)
 
-    global_var.pid_target_lookup = lookup
+        profile.append({
+            "t0": current_time,
+            "t1": current_time + duration,
+            "target": target_temp
+        })
+        current_time += duration
 
+    global_var.pid_target_profile = profile
+    print(f"[DEBUG] Target profile built: {len(profile)} steps, total time {current_time:.1f}s")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # WIZARD BUILD SEQUENCE
@@ -796,10 +882,22 @@ def _cmd_auto_ena(parent):
     _log_resp(parent, f"[UI] Auto ENA → profile {pid}")
 
 
+# def _cmd_auto_start(parent):
+#     pid = parent.tc_run_profile_id.value()
+#     _send(parent, f"temp_auto_start {pid}")
+#     build_target_profile(parent)   # vẽ đường target
+#     _log_resp(parent, f"[UI] Auto START → profile {pid}")
+
 def _cmd_auto_start(parent):
+    import global_var
     pid = parent.tc_run_profile_id.value()
+
+    _clear_pid_history(parent)        # Clear trước khi bắt đầu
+
+    global_var.pid_start_time = time.time()
+    build_target_profile(parent)
+
     _send(parent, f"temp_auto_start {pid}")
-    build_target_profile(parent)   # vẽ đường target
     _log_resp(parent, f"[UI] Auto START → profile {pid}")
 
 
@@ -922,7 +1020,7 @@ def _grp(title: str) -> QGroupBox:
         QGroupBox::title {{
             subcontrol-origin:margin; subcontrol-position:top left;
             left:12px; top:3px;
-            color:{ACCENT_CYAN}; font-size:11px; font-weight:800;
+            color:{ACCENT_CYAN}; font-size:{FONT_BASE + 2}px; font-weight:800;
             letter-spacing:2px;
         }}
     """)
@@ -973,21 +1071,38 @@ def _icon_btn(icon, accent):
     return b
 
 
+# def _lbl(text, bold=False):
+#     l = QLabel(text)
+#     fw = "700" if bold else "500"
+#     l.setStyleSheet(
+#         f"color:{TEXT_SEC};font-size:12px;font-weight:{fw};"
+#         f"background:transparent;"
+#     )
+#     return l
+
 def _lbl(text, bold=False):
     l = QLabel(text)
     fw = "700" if bold else "500"
     l.setStyleSheet(
-        f"color:{TEXT_SEC};font-size:12px;font-weight:{fw};"
+        f"color:{TEXT_SEC}; font-size:{FONT_BASE}px; font-weight:{fw};"
         f"background:transparent;"
     )
     return l
 
 
+# def _section_lbl(text):
+#     l = QLabel(text)
+#     l.setStyleSheet(
+#         f"color:{ACCENT_CYAN};font-size:11px;font-weight:700;"
+#         f"letter-spacing:1px;background:transparent;"
+#     )
+#     return l
+
 def _section_lbl(text):
     l = QLabel(text)
     l.setStyleSheet(
-        f"color:{ACCENT_CYAN};font-size:11px;font-weight:700;"
-        f"letter-spacing:1px;background:transparent;"
+        f"color:{ACCENT_CYAN}; font-size:{FONT_BASE + 1}px; font-weight:700;"
+        f"letter-spacing:1px; background:transparent;"
     )
     return l
 
@@ -1046,7 +1161,7 @@ def _lineedit(default, tip="", w=None):
 
 
 def _sb_style(compact=False):
-    fs = "10px" if compact else "12px"
+    fs = f"{FONT_BASE - 1}px" if compact else f"{FONT_BASE}px"
     return f"""
         QSpinBox,QDoubleSpinBox{{
             background:{BG_CARD};border:1.5px solid {BORDER};
@@ -1056,7 +1171,7 @@ def _sb_style(compact=False):
         QSpinBox:focus,QDoubleSpinBox:focus{{border-color:{ACCENT_CYAN};}}
         QSpinBox::up-button,QDoubleSpinBox::up-button,
         QSpinBox::down-button,QDoubleSpinBox::down-button{{
-            width:14px;border:none;background:transparent;
+            width:16px;border:none;background:transparent;
         }}
     """
 
