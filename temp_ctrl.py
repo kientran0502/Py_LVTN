@@ -1,36 +1,120 @@
-# temp_ctrl_ui.py  —  v3
-# PID realtime monitor + graph (fixed) + Profile Wizard tự động gửi tuần tự
+# temp_ctrl_ui.py  —  v5
+# - Theme sáng hơn, chữ to dễ đọc
+# - Target line vẽ đúng shape từng step
+# - Mode tự động (firmware quyết định), GUI không cần chọn
+# - Wizard state machine: chờ prompt firmware → mới gửi
 
 from PyQt5.QtWidgets import (
     QWidget, QGroupBox, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QLineEdit, QFrame, QSpinBox, QDoubleSpinBox,
-    QTextEdit, QSizePolicy, QScrollArea, QComboBox, QCheckBox
+    QTextEdit, QSizePolicy, QScrollArea, QComboBox
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal
 import pyqtgraph as pg
 import numpy as np
 
-# ─── Palette ──────────────────────────────────────────────────────────────────
-BG_SURFACE  = "#111520"
-BG_CARD     = "#161B28"
-BORDER      = "#1E2840"
-ACCENT_CYAN = "#00C8E8"
-ACCENT_TEAL = "#00E5B0"
-ACCENT_WARN = "#FFB347"
-ACCENT_ERR  = "#FF5C5C"
-ACCENT_PRP  = "#7B61FF"
-TEXT_PRIM   = "#E8ECF4"
-TEXT_SEC    = "#7A8BA8"
-TEXT_DIM    = "#3E4D65"
+# ─── Palette (sáng hơn, dễ đọc) ──────────────────────────────────────────────
+BG_SURFACE  = "#141C2E"
+BG_CARD     = "#1A2340"
+BORDER      = "#2E4070"
+ACCENT_CYAN = "#18E4FF"
+ACCENT_TEAL = "#00FFB2"
+ACCENT_WARN = "#FFBE4A"
+ACCENT_ERR  = "#FF6B6B"
+ACCENT_PRP  = "#A78BFF"
+TEXT_PRIM   = "#FFFFFF"
+TEXT_SEC    = "#C8D8F0"
+TEXT_DIM    = "#7090B8"
 
 STEP_COLORS = {
-    "NONE": ("#1A1D2E", "#7A8BA8"),
-    "HEAT": ("#2A1500", "#FFB347"),
-    "COOL": ("#001525", "#00C8E8"),
-    "SOAK": ("#001A0F", "#00E5B0"),
+    "NONE": ("#1E2840", "#90A8C8"),
+    "HEAT": ("#3A1800", "#FFBE4A"),
+    "COOL": ("#00223A", "#18E4FF"),
+    "SOAK": ("#003020", "#00FFB2"),
 }
 
-STEP_MODE_OPTIONS = ["SOAK", "HEAT", "COOL"]   # index 0/1/2 = firmware value
+MAX_STEPS        = 8
+WIZARD_TIMEOUT_MS = 10000   # 10s timeout mỗi bước
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WIZARD STATE MACHINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+WIZ_TRIGGERS = [
+    "(y/n)",
+    "profile index:",
+    "main ntc:",
+    "sec ntc:",
+    "tec mask:",
+    "heater mask:",
+    "setpoint (0.01*c):",
+    "main-sec delta (0.01*c):",
+    "step count:",
+    "step[",
+    "save? (y/n)",
+]
+
+
+class WizardStateMachine(QObject):
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, parent, seq: list):
+        super().__init__()
+        self._parent = parent
+        self._seq    = seq
+        self._idx    = 0
+        self._active = False
+
+        self._timeout = QTimer(self)
+        self._timeout.setSingleShot(True)
+        self._timeout.timeout.connect(self._on_timeout)
+
+    def start(self):
+        self._active = True
+        self._idx    = 1                        # seq[0] đã gửi bên ngoài
+        _send(self._parent, self._seq[0])
+        _log_resp(self._parent,
+                  f"[WIZ] Started — {len(self._seq)-1} responses queued")
+        self._reset_timeout()
+
+    def feed_line(self, line: str):
+        if not self._active or self._idx >= len(self._seq):
+            return
+        if not any(t in line.lower() for t in WIZ_TRIGGERS):
+            return
+
+        resp = self._seq[self._idx]
+        self._idx += 1
+        _log_resp(self._parent,
+                  f"[WIZ {self._idx}/{len(self._seq)}] "
+                  f"← '{line.strip()[:48]}'  →  '{resp}'")
+        _send(self._parent, resp)
+        self._reset_timeout()
+
+        if self._idx >= len(self._seq):
+            self._finish(True, "Profile saved ✓")
+
+    def cancel(self):
+        self._active = False
+        self._timeout.stop()
+
+    def is_active(self):
+        return self._active
+
+    def _reset_timeout(self):
+        self._timeout.stop()
+        self._timeout.start(WIZARD_TIMEOUT_MS)
+
+    def _on_timeout(self):
+        self._finish(False,
+                     f"Timeout at step {self._idx}/{len(self._seq)} — "
+                     "firmware did not respond")
+
+    def _finish(self, ok, msg):
+        self._active = False
+        self._timeout.stop()
+        self.finished.emit(ok, msg)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -38,21 +122,23 @@ STEP_MODE_OPTIONS = ["SOAK", "HEAT", "COOL"]   # index 0/1/2 = firmware value
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def create_temp_ctrl_tab(parent) -> QWidget:
+    parent._wizard_sm = None
+
     root = QScrollArea()
     root.setWidgetResizable(True)
-    root.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+    root.setStyleSheet("QScrollArea{border:none;background:transparent;}")
 
     inner = QWidget()
     lay   = QVBoxLayout(inner)
-    lay.setSpacing(8)
-    lay.setContentsMargins(4, 4, 4, 4)
+    lay.setSpacing(10)
+    lay.setContentsMargins(6, 6, 6, 6)
 
-    lay.addWidget(_build_pid_monitor(parent))   # A. STEP + cards
-    lay.addWidget(_build_pid_graph(parent))     # B. PV/SP graph
-    lay.addWidget(_build_profile_wizard(parent))# C. Profile wizard (NEW)
-    lay.addWidget(_build_pid_section(parent))   # D. PID constants
-    lay.addWidget(_build_run_section(parent))   # E. Run control
-    lay.addWidget(_build_response_box(parent), stretch=1)  # F. Log
+    lay.addWidget(_build_pid_monitor(parent))
+    lay.addWidget(_build_pid_graph(parent))
+    lay.addWidget(_build_profile_wizard(parent))
+    lay.addWidget(_build_pid_section(parent))
+    lay.addWidget(_build_run_section(parent))
+    lay.addWidget(_build_response_box(parent), stretch=1)
 
     root.setWidget(inner)
     return root
@@ -63,104 +149,81 @@ def create_temp_ctrl_tab(parent) -> QWidget:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_pid_monitor(parent) -> QGroupBox:
-    grp = QGroupBox("PID  MONITOR  —  REALTIME")
+    grp = _grp("PID  MONITOR  —  REALTIME")
     lay = QVBoxLayout()
-    lay.setContentsMargins(8, 8, 8, 8)
-    lay.setSpacing(8)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(10)
 
     parent.pid_step_badge = _StepBadge()
     lay.addWidget(parent.pid_step_badge)
 
     row = QHBoxLayout()
-    row.setSpacing(6)
-    parent.pid_card_sp  = _MetricCard("SP",  "°C", ACCENT_CYAN)
-    parent.pid_card_pv  = _MetricCard("PV",  "°C", ACCENT_TEAL)
-    parent.pid_card_err = _MetricCard("ERR", "°C", ACCENT_WARN)
-    parent.pid_card_out = _MetricCard("OUT", "%",  ACCENT_PRP)
+    row.setSpacing(8)
+    parent.pid_card_sp  = _MetricCard("SET POINT", "°C", ACCENT_CYAN)
+    parent.pid_card_pv  = _MetricCard("MEASURED",  "°C", ACCENT_TEAL)
+    parent.pid_card_err = _MetricCard("ERROR",     "°C", ACCENT_WARN)
+    parent.pid_card_out = _MetricCard("OUTPUT",    "%",  ACCENT_PRP)
     for c in (parent.pid_card_sp, parent.pid_card_pv,
               parent.pid_card_err, parent.pid_card_out):
         row.addWidget(c)
-
     lay.addLayout(row)
     grp.setLayout(lay)
     return grp
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# B.  PID GRAPH  (fixed: dùng numpy array, ViewBox autoRange)
+# B.  PID GRAPH
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_pid_graph(parent) -> QGroupBox:
-    grp = QGroupBox("PV  vs  SP  HISTORY")
+    grp = _grp("TEMPERATURE  GRAPH")
     lay = QVBoxLayout()
-    lay.setContentsMargins(6, 6, 6, 6)
+    lay.setContentsMargins(8, 8, 8, 8)
 
     pg.setConfigOptions(antialias=True)
-
     pw = pg.PlotWidget()
     pw.setBackground(BG_CARD)
-    pw.setFixedHeight(170)
-    pw.showGrid(x=True, y=True, alpha=0.15)
-    pw.setLabel("left",   "°C",     color=TEXT_SEC, size="9pt")
-    pw.setLabel("bottom", "sample", color=TEXT_SEC, size="9pt")
-    pw.getViewBox().setMouseEnabled(x=True, y=True)   # allow pan/zoom
+    pw.setFixedHeight(300)
+    pw.showGrid(x=True, y=True, alpha=0.18)
+    pw.setLabel("left",   "°C",     color=TEXT_SEC, size="10pt")
+    pw.setLabel("bottom", "sample", color=TEXT_SEC, size="10pt")
+    pw.getViewBox().setMouseEnabled(x=True, y=True)
 
-    axis_pen = pg.mkPen(color=BORDER, width=1)
     for name in ("left", "bottom"):
         ax = pw.getAxis(name)
-        ax.setPen(axis_pen)
+        ax.setPen(pg.mkPen(color=BORDER, width=1))
         ax.setTextPen(pg.mkPen(color=TEXT_SEC))
+        ax.setStyle(tickFont=pg.QtGui.QFont("Segoe UI", 9))
 
     pw.addLegend(
-        offset=(8, 8),
+        offset=(10, 10),
         labelTextColor=TEXT_SEC,
         pen=pg.mkPen(color=BORDER),
-        brush=pg.mkBrush(BG_SURFACE + "CC"),
+        brush=pg.mkBrush(BG_SURFACE + "DD"),
     )
 
-    # ── curves stored on parent ───────────────────────────────────────────────
-    parent.pid_curve_pv  = pw.plot(
-        np.array([], dtype=float), np.array([], dtype=float),
-        pen=pg.mkPen(color=ACCENT_TEAL, width=2), name="PV"
-    )
-    parent.pid_curve_sp  = pw.plot(
-        np.array([], dtype=float), np.array([], dtype=float),
-        pen=pg.mkPen(color=ACCENT_CYAN, width=1.5, style=Qt.DashLine), name="SP"
-    )
-    parent.pid_curve_err = pw.plot(
-        np.array([], dtype=float), np.array([], dtype=float),
-        pen=pg.mkPen(color=ACCENT_WARN, width=1,   style=Qt.DotLine),  name="ERR"
-    )
+    empty = np.array([], dtype=float)
 
-    # keep reference to PlotWidget so we can call autoRange
+    # PV — đường đo thực tế, nét liền xanh lá
+    parent.pid_curve_pv = pw.plot(empty, empty,
+        pen=pg.mkPen(color=ACCENT_TEAL, width=2.5), name="PV  (measured)")
+
+    # TARGET — đường mục tiêu, nét đứt đỏ cam
+    parent.pid_curve_target = pw.plot(empty, empty,
+        pen=pg.mkPen(color=ACCENT_WARN, width=2,
+                     style=Qt.DashLine), name="TARGET (setpoint)")
+
     parent._pid_plot_widget = pw
-
     lay.addWidget(pw)
 
     btn_row = QHBoxLayout()
-    auto_range_btn = QPushButton("Auto range")
-    auto_range_btn.setFixedHeight(22)
-    auto_range_btn.setStyleSheet(
-        f"QPushButton {{ background:transparent; border:none; "
-        f"color:{TEXT_SEC}; font-size:10px; }}"
-        f"QPushButton:hover {{ color:{ACCENT_CYAN}; }}"
-    )
-    auto_range_btn.clicked.connect(
-        lambda: parent._pid_plot_widget.getViewBox().autoRange()
-    )
-
-    clear_btn = QPushButton("Clear")
-    clear_btn.setFixedHeight(22)
-    clear_btn.setStyleSheet(
-        f"QPushButton {{ background:transparent; border:none; "
-        f"color:{TEXT_DIM}; font-size:10px; }}"
-        f"QPushButton:hover {{ color:{ACCENT_ERR}; }}"
-    )
-    clear_btn.clicked.connect(lambda: _clear_pid_history(parent))
-
-    btn_row.addWidget(auto_range_btn)
+    ar = _text_btn("⊞  Auto range", TEXT_SEC, hover=ACCENT_CYAN)
+    ar.clicked.connect(lambda: parent._pid_plot_widget.getViewBox().autoRange())
+    cl = _text_btn("✕  Clear", TEXT_DIM, hover=ACCENT_ERR)
+    cl.clicked.connect(lambda: _clear_pid_history(parent))
+    btn_row.addWidget(ar)
     btn_row.addStretch()
-    btn_row.addWidget(clear_btn)
+    btn_row.addWidget(cl)
     lay.addLayout(btn_row)
 
     grp.setLayout(lay)
@@ -168,288 +231,231 @@ def _build_pid_graph(parent) -> QGroupBox:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# C.  PROFILE WIZARD  (nhập form → tự gửi tuần tự)
+# C.  PROFILE WIZARD
+# Mode tự động: GUI gửi "start stop dur" (3 số), firmware tự chọn mode
 # ═══════════════════════════════════════════════════════════════════════════════
-# Flow firmware (từ log thực tế):
-#   1. temp_profile_set <id>
-#   2. firmware: "Do you want to continue? (Y/N)"  → gửi "y"
-#   3. firmware wizard hỏi từng thông số → gửi giá trị lần lượt
-#      (profile index, main ntc, sec ntc, tec mask, heater mask,
-#       setpoint *100, delta *100, step count)
-#   4. với mỗi step: gửi "start stop duration mode"  (start/stop *100)
-#   5. firmware: "Save? (Y/N)" → gửi "y"
-# ═══════════════════════════════════════════════════════════════════════════════
-
-MAX_STEPS = 8
 
 def _build_profile_wizard(parent) -> QGroupBox:
-    grp = QGroupBox("PROFILE  WIZARD  —  AUTO SEND")
+    grp = _grp("PROFILE  WIZARD")
     outer = QVBoxLayout()
-    outer.setSpacing(8)
-    outer.setContentsMargins(8, 8, 8, 8)
+    outer.setSpacing(10)
+    outer.setContentsMargins(10, 10, 10, 10)
 
-    # ── Header row: Profile ID + Display + Validate ───────────────────────────
+    # ── Header ────────────────────────────────────────────────────────────────
     hdr = QHBoxLayout()
-    hdr.setSpacing(6)
+    hdr.setSpacing(8)
+    hdr.addWidget(_lbl("Profile ID", bold=True))
 
-    hdr.addWidget(_lbl("Profile ID"))
-    parent.wiz_profile_id = QSpinBox()
-    parent.wiz_profile_id.setRange(0, 7)
-    parent.wiz_profile_id.setFixedHeight(26)
-    parent.wiz_profile_id.setStyleSheet(_spinbox_style())
-    parent.wiz_profile_id.setFixedWidth(60)
+    parent.wiz_profile_id = _spinbox(0, 7, 0, w=65)
     hdr.addWidget(parent.wiz_profile_id)
 
-    disp_btn = _small_btn("Display", ACCENT_CYAN)
-    disp_btn.setToolTip("temp_profile_diplay <id>")
-    disp_btn.clicked.connect(lambda: _send(
+    db = _action_btn("Display", ACCENT_CYAN, h=28)
+    db.setToolTip("temp_profile_diplay <id>")
+    db.clicked.connect(lambda: _send(
         parent, f"temp_profile_diplay {parent.wiz_profile_id.value()}"
     ))
+    vb = _action_btn("Validate", ACCENT_WARN, h=28)
+    vb.setToolTip("temp_profile_val")
+    vb.clicked.connect(lambda: _send(parent, "temp_profile_val"))
 
-    val_btn = _small_btn("Validate", ACCENT_WARN)
-    val_btn.setToolTip("temp_profile_val")
-    val_btn.clicked.connect(lambda: _send(parent, "temp_profile_val"))
-
-    hdr.addWidget(disp_btn)
-    hdr.addWidget(val_btn)
+    hdr.addWidget(db)
+    hdr.addWidget(vb)
     hdr.addStretch()
     outer.addLayout(hdr)
-
     outer.addWidget(_hline())
 
-    # ── Profile parameters ────────────────────────────────────────────────────
-    outer.addWidget(_section_lbl("  Profile parameters"))
+    # ── Profile params ────────────────────────────────────────────────────────
+    outer.addWidget(_section_lbl("Profile parameters"))
 
-    param_grid = QGridLayout()
-    param_grid.setSpacing(5)
-    param_grid.setHorizontalSpacing(8)
+    pg = QGridLayout()
+    pg.setSpacing(6)
+    pg.setHorizontalSpacing(12)
 
-    def _add_spin(row, col, label, attr, lo, hi, default, tip=""):
-        param_grid.addWidget(_lbl(label), row, col*2)
-        sp = QSpinBox()
-        sp.setRange(lo, hi)
-        sp.setValue(default)
-        sp.setFixedHeight(26)
-        sp.setFixedWidth(72)
-        sp.setStyleSheet(_spinbox_style())
-        if tip:
-            sp.setToolTip(tip)
+    def _ps(row, col, label, attr, lo, hi, default, tip=""):
+        pg.addWidget(_lbl(label), row, col * 2)
+        sp = _spinbox(lo, hi, default, tip=tip)
         setattr(parent, attr, sp)
-        param_grid.addWidget(sp, row, col*2+1)
+        pg.addWidget(sp, row, col * 2 + 1)
 
-    # row 0
-    _add_spin(0, 0, "Main NTC",  "wiz_main_ntc",  0, 7, 0, "0=NTC1 … 7=NTC8")
-    _add_spin(0, 1, "Sec NTC",   "wiz_sec_ntc",   0, 7, 1, "0=NTC1 … 7=NTC8")
+    _ps(0, 0, "Main NTC",    "wiz_main_ntc",  0, 7, 0, "0=NTC1…7=NTC8")
+    _ps(0, 1, "Sec NTC",     "wiz_sec_ntc",   0, 7, 1, "0=NTC1…7=NTC8")
 
-    # row 1 — mask fields (hex input)
-    param_grid.addWidget(_lbl("TEC mask"), 1, 0)
-    parent.wiz_tec_mask = QLineEdit("0x01")
-    parent.wiz_tec_mask.setFixedHeight(26)
-    parent.wiz_tec_mask.setFixedWidth(72)
-    parent.wiz_tec_mask.setToolTip("e.g. 0x01 = TEC1 enabled")
-    parent.wiz_tec_mask.setStyleSheet(_input_style())
-    param_grid.addWidget(parent.wiz_tec_mask, 1, 1)
+    pg.addWidget(_lbl("TEC mask"), 1, 0)
+    parent.wiz_tec_mask = _lineedit("0x01", tip="e.g. 0x01 = TEC1 on", w=80)
+    pg.addWidget(parent.wiz_tec_mask, 1, 1)
 
-    param_grid.addWidget(_lbl("Heater mask"), 1, 2)
-    parent.wiz_heater_mask = QLineEdit("0x02")
-    parent.wiz_heater_mask.setFixedHeight(26)
-    parent.wiz_heater_mask.setFixedWidth(72)
-    parent.wiz_heater_mask.setToolTip("e.g. 0x02 = Heater2 enabled")
-    parent.wiz_heater_mask.setStyleSheet(_input_style())
-    param_grid.addWidget(parent.wiz_heater_mask, 1, 3)
+    pg.addWidget(_lbl("Heater mask"), 1, 2)
+    parent.wiz_heater_mask = _lineedit("0x02", tip="e.g. 0x02 = Heater2 on", w=80)
+    pg.addWidget(parent.wiz_heater_mask, 1, 3)
 
-    # row 2 — setpoint, delta  (nhập °C, tự *100 khi gửi)
-    param_grid.addWidget(_lbl("Setpoint °C"), 2, 0)
-    parent.wiz_setpoint = QDoubleSpinBox()
-    parent.wiz_setpoint.setRange(-50.0, 150.0)
-    parent.wiz_setpoint.setValue(25.0)
-    parent.wiz_setpoint.setDecimals(2)
-    parent.wiz_setpoint.setSingleStep(0.5)
-    parent.wiz_setpoint.setFixedHeight(26)
-    parent.wiz_setpoint.setFixedWidth(80)
-    parent.wiz_setpoint.setStyleSheet(_spinbox_style())
-    parent.wiz_setpoint.setToolTip("firmware nhận giá trị *100  (tự động)")
-    param_grid.addWidget(parent.wiz_setpoint, 2, 1)
+    pg.addWidget(_lbl("Setpoint °C"), 2, 0)
+    parent.wiz_setpoint = _dspinbox(-50, 150, 25.0, tip="Firmware nhận *100 tự động")
+    pg.addWidget(parent.wiz_setpoint, 2, 1)
 
-    param_grid.addWidget(_lbl("Delta °C"), 2, 2)
-    parent.wiz_delta = QDoubleSpinBox()
-    parent.wiz_delta.setRange(0.0, 50.0)
-    parent.wiz_delta.setValue(0.0)
-    parent.wiz_delta.setDecimals(2)
-    parent.wiz_delta.setSingleStep(0.1)
-    parent.wiz_delta.setFixedHeight(26)
-    parent.wiz_delta.setFixedWidth(80)
-    parent.wiz_delta.setStyleSheet(_spinbox_style())
-    param_grid.addWidget(parent.wiz_delta, 2, 3)
+    pg.addWidget(_lbl("Delta °C"), 2, 2)
+    parent.wiz_delta = _dspinbox(0, 50, 0.0)
+    pg.addWidget(parent.wiz_delta, 2, 3)
 
-    outer.addLayout(param_grid)
+    outer.addLayout(pg)
     outer.addWidget(_hline())
 
-    # ── Step count ────────────────────────────────────────────────────────────
+    # ── Steps ─────────────────────────────────────────────────────────────────
     sc_row = QHBoxLayout()
-    sc_row.addWidget(_lbl("Step count"))
-    parent.wiz_step_count = QSpinBox()
-    parent.wiz_step_count.setRange(1, MAX_STEPS)
-    parent.wiz_step_count.setValue(3)
-    parent.wiz_step_count.setFixedHeight(26)
-    parent.wiz_step_count.setFixedWidth(60)
-    parent.wiz_step_count.setStyleSheet(_spinbox_style())
-    parent.wiz_step_count.valueChanged.connect(
-        lambda v: _refresh_step_rows(parent)
-    )
+    sc_row.addWidget(_lbl("Step count", bold=True))
+    parent.wiz_step_count = _spinbox(1, MAX_STEPS, 3, w=65)
+    parent.wiz_step_count.valueChanged.connect(lambda v: _refresh_step_rows(parent))
     sc_row.addWidget(parent.wiz_step_count)
     sc_row.addStretch()
     outer.addLayout(sc_row)
 
-    # ── Step rows container ───────────────────────────────────────────────────
-    outer.addWidget(_section_lbl("  Steps  [ start°C   stop°C   dur(s)   mode ]"))
+    # header labels
+    hd = QHBoxLayout()
+    hd.setContentsMargins(28, 0, 0, 0)
+    for txt, stretch in [("start °C", 1), ("stop °C", 1), ("duration  s", 1), ("mode", 1)]:
+        l = QLabel(txt)
+        l.setStyleSheet(
+            f"color:{TEXT_DIM};font-size:10px;font-weight:600;"
+            f"letter-spacing:0.5px;background:transparent;"
+        )
+        l.setAlignment(Qt.AlignCenter)
+        hd.addWidget(l, stretch)
+    outer.addLayout(hd)
 
     parent._wiz_step_container = QVBoxLayout()
     parent._wiz_step_container.setSpacing(4)
-
-    parent._wiz_steps = []   # list of (start, stop, dur, mode_combo)
+    parent._wiz_steps = []
 
     for i in range(MAX_STEPS):
-        row_widget, widgets = _make_step_row(i)
+        row_w, widgets = _make_step_row(i)
         parent._wiz_steps.append(widgets)
-        parent._wiz_step_container.addWidget(row_widget)
+        parent._wiz_step_container.addWidget(row_w)
 
     outer.addLayout(parent._wiz_step_container)
-    _refresh_step_rows(parent)   # show only step_count rows
-
+    _refresh_step_rows(parent)
     outer.addWidget(_hline())
 
-    # ── Send button ───────────────────────────────────────────────────────────
-    send_row = QHBoxLayout()
-    send_row.setSpacing(6)
+    # ── Status ────────────────────────────────────────────────────────────────
+    parent.wiz_status_lbl = QLabel("Idle")
+    parent.wiz_status_lbl.setAlignment(Qt.AlignCenter)
+    parent.wiz_status_lbl.setStyleSheet(
+        f"color:{TEXT_DIM};font-size:11px;font-style:italic;background:transparent;"
+    )
+    outer.addWidget(parent.wiz_status_lbl)
 
-    send_btn = QPushButton("⟳  SEND PROFILE  (auto wizard)")
-    send_btn.setFixedHeight(34)
-    send_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-    send_btn.setStyleSheet(f"""
-        QPushButton {{
-            background-color: {ACCENT_TEAL}18;
-            border: 1px solid {ACCENT_TEAL}60;
-            border-radius: 7px;
-            color: {ACCENT_TEAL};
-            font-size: 12px; font-weight: 700; letter-spacing: 1px;
-        }}
-        QPushButton:hover {{
-            background-color: {ACCENT_TEAL}30; border-color: {ACCENT_TEAL};
-        }}
-        QPushButton:pressed {{ background-color: {ACCENT_TEAL}10; }}
-    """)
+    # ── Send / Cancel ─────────────────────────────────────────────────────────
+    bc = QHBoxLayout()
+    bc.setSpacing(8)
+
+    send_btn = _action_btn("⟳  SEND PROFILE", ACCENT_TEAL, h=38, bold=True)
     send_btn.setToolTip(
-        "Gửi toàn bộ wizard tự động:\n"
-        "temp_profile_set → y → params → steps → y (save)"
+        "Gửi wizard tự động — chờ từng prompt firmware\n"
+        "Mode (HEAT/COOL/SOAK) do firmware tự quyết định"
     )
     send_btn.clicked.connect(lambda: _cmd_send_wizard(parent))
+    parent._wiz_send_btn = send_btn
 
-    # Manual wizard fallback
+    cancel_btn = _action_btn("✕  CANCEL", ACCENT_ERR, h=38, w=100)
+    cancel_btn.setVisible(False)
+    cancel_btn.clicked.connect(lambda: _cmd_cancel_wizard(parent))
+    parent._wiz_cancel_btn = cancel_btn
+
+    bc.addWidget(send_btn)
+    bc.addWidget(cancel_btn)
+    outer.addLayout(bc)
+
+    # ── Manual ────────────────────────────────────────────────────────────────
+    mr = QHBoxLayout()
+    mr.setSpacing(6)
+    mr.addWidget(_lbl("Manual:"))
     parent.tc_wizard_input = QLineEdit()
-    parent.tc_wizard_input.setPlaceholderText("Manual wizard line  (Y / value)")
-    parent.tc_wizard_input.setFixedHeight(28)
+    parent.tc_wizard_input.setPlaceholderText("Y / N / value — nhấn Enter để gửi")
+    parent.tc_wizard_input.setFixedHeight(30)
     parent.tc_wizard_input.setStyleSheet(_input_style())
     parent.tc_wizard_input.returnPressed.connect(lambda: _cmd_wizard_send(parent))
-
-    send_wiz_icon = _icon_btn("↵", ACCENT_CYAN)
-    send_wiz_icon.setToolTip("Gửi dòng thủ công")
-    send_wiz_icon.clicked.connect(lambda: _cmd_wizard_send(parent))
-
-    send_row.addWidget(send_btn)
-    outer.addLayout(send_row)
-
-    manual_row = QHBoxLayout()
-    manual_row.addWidget(_lbl("Manual:"))
-    manual_row.addWidget(parent.tc_wizard_input)
-    manual_row.addWidget(send_wiz_icon)
-    outer.addLayout(manual_row)
+    ib = _icon_btn("↵", ACCENT_CYAN)
+    ib.clicked.connect(lambda: _cmd_wizard_send(parent))
+    mr.addWidget(parent.tc_wizard_input)
+    mr.addWidget(ib)
+    outer.addLayout(mr)
 
     grp.setLayout(outer)
     return grp
 
 
 def _make_step_row(index: int):
-    """Tạo 1 hàng step với 4 field: start, stop, duration, mode."""
+    """
+    1 hàng step: [idx] start  stop  duration  [MODE badge tự động]
+    Mode tự động dựa start vs stop, chỉ hiển thị (không gửi xuống firmware).
+    Firmware tự quyết định mode — GUI chỉ gửi "start stop dur".
+    """
     widget = QFrame()
     widget.setStyleSheet(
-        f"QFrame {{ background: {BG_SURFACE}; border: 1px solid {BORDER}; "
-        f"border-radius: 5px; }}"
+        f"QFrame{{background:{BG_CARD};border:1px solid {BORDER};"
+        f"border-radius:6px;}}"
     )
     row = QHBoxLayout(widget)
-    row.setContentsMargins(6, 3, 6, 3)
-    row.setSpacing(6)
+    row.setContentsMargins(8, 4, 8, 4)
+    row.setSpacing(8)
 
     idx_lbl = QLabel(f"[{index}]")
-    idx_lbl.setFixedWidth(22)
-    idx_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px; background: transparent; border: none;")
+    idx_lbl.setFixedWidth(24)
+    idx_lbl.setStyleSheet(
+        f"color:{TEXT_DIM};font-size:11px;font-weight:700;"
+        f"background:transparent;border:none;"
+    )
     row.addWidget(idx_lbl)
 
-    def _dspin(default, lo=-50.0, hi=200.0):
-        s = QDoubleSpinBox()
-        s.setRange(lo, hi)
-        s.setValue(default)
-        s.setDecimals(2)
-        s.setSingleStep(1.0)
-        s.setFixedHeight(24)
-        s.setStyleSheet(_spinbox_style_compact())
-        return s
+    start = _dspinbox(-50, 200, 25.0, compact=True)
+    stop  = _dspinbox(-50, 200, 40.0, compact=True)
+    dur   = _spinbox2(0, 86400, 60, compact=True)
 
-    def _ispin(default, lo=0, hi=86400):
-        s = QSpinBox()
-        s.setRange(lo, hi)
-        s.setValue(default)
-        s.setFixedHeight(24)
-        s.setStyleSheet(_spinbox_style_compact())
-        return s
+    # Badge hiển thị mode — tự động theo start/stop
+    mode_badge = QLabel("HEAT")
+    mode_badge.setFixedWidth(60)
+    mode_badge.setAlignment(Qt.AlignCenter)
+    mode_badge.setStyleSheet(_mode_badge_style("HEAT"))
 
-    start = _dspin(25.0)
-    stop  = _dspin(40.0)
-    dur   = _ispin(60)
+    def _update_badge():
+        s, e = start.value(), stop.value()
+        if e > s:   mode = "HEAT"
+        elif e < s: mode = "COOL"
+        else:       mode = "SOAK"
+        mode_badge.setText(mode)
+        mode_badge.setStyleSheet(_mode_badge_style(mode))
 
-    mode  = QComboBox()
-    mode.addItems(["0 – SOAK", "1 – HEAT", "2 – COOL"])
-    mode.setFixedHeight(24)
-    mode.setStyleSheet(f"""
-        QComboBox {{
-            background: {BG_CARD}; border: 1px solid {BORDER};
-            border-radius: 4px; color: {ACCENT_CYAN};
-            font-size: 10px; padding: 1px 4px;
-        }}
-        QComboBox QAbstractItemView {{
-            background: {BG_CARD}; color: {TEXT_PRIM};
-            selection-background-color: #1C2540;
-        }}
-        QComboBox::drop-down {{ border: none; width: 14px; }}
-    """)
+    start.valueChanged.connect(lambda _: _update_badge())
+    stop.valueChanged.connect(lambda _: _update_badge())
+    _update_badge()
 
-    for lbl_txt, w in [("start", start), ("stop", stop), ("dur s", dur), ("mode", mode)]:
-        mini = QLabel(lbl_txt)
-        mini.setStyleSheet(
-            f"color: {TEXT_DIM}; font-size: 9px; background: transparent; border: none;"
-        )
-        row.addWidget(mini)
-        row.addWidget(w)
+    for w in (start, stop, dur):
+        row.addWidget(w, stretch=1)
+    row.addWidget(mode_badge)
 
-    return widget, (start, stop, dur, mode)
+    return widget, (start, stop, dur, mode_badge)
+
+
+def _mode_badge_style(mode: str) -> str:
+    colors = {
+        "HEAT": (ACCENT_WARN,  "#3A1800"),
+        "COOL": (ACCENT_CYAN,  "#00223A"),
+        "SOAK": (ACCENT_TEAL,  "#003020"),
+    }
+    fg, bg = colors.get(mode, (TEXT_DIM, BG_SURFACE))
+    return (
+        f"background:{bg};border:1px solid {fg}66;"
+        f"border-radius:4px;color:{fg};"
+        f"font-size:10px;font-weight:800;letter-spacing:1px;"
+        f"padding:2px 4px;"
+    )
 
 
 def _refresh_step_rows(parent):
-    """Show/hide step rows berdasarkan step_count."""
-    n = parent.wiz_step_count.value()
-    for i, (row_widget, _) in enumerate(
-        _iter_step_row_widgets(parent)
-    ):
-        row_widget.setVisible(i < n)
-
-
-def _iter_step_row_widgets(parent):
-    """Yield (QFrame, widgets_tuple) for each step row."""
+    n   = parent.wiz_step_count.value()
     lay = parent._wiz_step_container
     for i in range(lay.count()):
         item = lay.itemAt(i)
         if item and item.widget():
-            yield item.widget(), parent._wiz_steps[i]
+            item.widget().setVisible(i < n)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -457,45 +463,33 @@ def _iter_step_row_widgets(parent):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_pid_section(parent) -> QGroupBox:
-    grp = QGroupBox("PID  CONSTANTS")
+    grp = _grp("PID  CONSTANTS")
     lay = QVBoxLayout()
-    lay.setSpacing(6)
-    lay.setContentsMargins(8, 8, 8, 8)
+    lay.setSpacing(8)
+    lay.setContentsMargins(10, 10, 10, 10)
 
-    sid_row = QHBoxLayout()
-    sid_row.addWidget(_lbl("State ID"))
-    parent.tc_pid_state = QSpinBox()
-    parent.tc_pid_state.setRange(1, 8)
-    parent.tc_pid_state.setValue(1)
-    parent.tc_pid_state.setFixedHeight(28)
-    parent.tc_pid_state.setStyleSheet(_spinbox_style())
-    sid_row.addWidget(parent.tc_pid_state)
-    sid_row.addStretch()
-    lay.addLayout(sid_row)
+    sr = QHBoxLayout()
+    sr.addWidget(_lbl("State ID", bold=True))
+    parent.tc_pid_state = _spinbox(1, 8, 1)
+    sr.addWidget(parent.tc_pid_state)
+    sr.addStretch()
+    lay.addLayout(sr)
 
-    pid_grid = QGridLayout()
-    pid_grid.setSpacing(6)
-    for col, (lbl_txt, attr) in enumerate(
-        [("Kp", "tc_kp"), ("Ki", "tc_ki"), ("Kd", "tc_kd")]
-    ):
-        l = _lbl(lbl_txt)
+    pg2 = QGridLayout()
+    pg2.setSpacing(6)
+    for col, (t, attr) in enumerate([("Kp", "tc_kp"), ("Ki", "tc_ki"), ("Kd", "tc_kd")]):
+        l = _lbl(t, bold=True)
         l.setAlignment(Qt.AlignCenter)
-        pid_grid.addWidget(l, 0, col)
-        sp = QDoubleSpinBox()
-        sp.setRange(0.0, 100.0)
-        sp.setSingleStep(0.1)
-        sp.setDecimals(2)
-        sp.setValue(1.0)
-        sp.setFixedHeight(28)
-        sp.setStyleSheet(_spinbox_style())
+        pg2.addWidget(l, 0, col)
+        sp = _dspinbox(0, 100, 1.0)
         setattr(parent, attr, sp)
-        pid_grid.addWidget(sp, 1, col)
-    lay.addLayout(pid_grid)
+        pg2.addWidget(sp, 1, col)
+    lay.addLayout(pg2)
 
     r = QHBoxLayout()
-    r.setSpacing(6)
-    g = _btn("GET", ACCENT_CYAN)
-    s = _btn("SET", ACCENT_TEAL)
+    r.setSpacing(8)
+    g = _action_btn("GET", ACCENT_CYAN)
+    s = _action_btn("SET", ACCENT_TEAL)
     g.setToolTip("temp_auto_pid_get <state_id>")
     s.setToolTip("temp_auto_pid_set <state_id> kp ki kd")
     g.clicked.connect(lambda: _cmd_pid_get(parent))
@@ -503,7 +497,6 @@ def _build_pid_section(parent) -> QGroupBox:
     r.addWidget(g)
     r.addWidget(s)
     lay.addLayout(r)
-
     grp.setLayout(lay)
     return grp
 
@@ -513,35 +506,29 @@ def _build_pid_section(parent) -> QGroupBox:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_run_section(parent) -> QGroupBox:
-    grp = QGroupBox("RUN  CONTROL")
+    grp = _grp("RUN  CONTROL")
     lay = QVBoxLayout()
-    lay.setSpacing(6)
-    lay.setContentsMargins(8, 8, 8, 8)
+    lay.setSpacing(8)
+    lay.setContentsMargins(10, 10, 10, 10)
 
-    rid_row = QHBoxLayout()
-    rid_row.addWidget(_lbl("Profile ID"))
-    parent.tc_run_profile_id = QSpinBox()
-    parent.tc_run_profile_id.setRange(0, 7)
-    parent.tc_run_profile_id.setValue(0)
-    parent.tc_run_profile_id.setFixedHeight(28)
-    parent.tc_run_profile_id.setStyleSheet(_spinbox_style())
+    rr = QHBoxLayout()
+    rr.addWidget(_lbl("Profile ID", bold=True))
+    parent.tc_run_profile_id = _spinbox(0, 7, 0)
 
-    # sync với wiz_profile_id
     parent.wiz_profile_id.valueChanged.connect(
         lambda v: parent.tc_run_profile_id.setValue(v)
     )
     parent.tc_run_profile_id.valueChanged.connect(
         lambda v: parent.wiz_profile_id.setValue(v)
     )
-
-    rid_row.addWidget(parent.tc_run_profile_id)
-    rid_row.addStretch()
-    lay.addLayout(rid_row)
+    rr.addWidget(parent.tc_run_profile_id)
+    rr.addStretch()
+    lay.addLayout(rr)
 
     r1 = QHBoxLayout()
-    r1.setSpacing(6)
-    ena = _btn("▶  AUTO ENA",    ACCENT_TEAL)
-    sta = _btn("▶▶  AUTO START", ACCENT_CYAN)
+    r1.setSpacing(8)
+    ena = _action_btn("▶  AUTO ENA",    ACCENT_TEAL)
+    sta = _action_btn("▶▶  AUTO START", ACCENT_CYAN)
     ena.setToolTip("temp_auto_ena <id>")
     sta.setToolTip("temp_auto_start <id>")
     ena.clicked.connect(lambda: _cmd_auto_ena(parent))
@@ -551,11 +538,11 @@ def _build_run_section(parent) -> QGroupBox:
     lay.addLayout(r1)
 
     r2 = QHBoxLayout()
-    r2.setSpacing(6)
-    mn  = _btn("⚙  MANUAL",     ACCENT_WARN)
-    lg  = _btn("◉  TOGGLE LOG", ACCENT_PRP)
+    r2.setSpacing(8)
+    mn = _action_btn("⚙  MANUAL",     ACCENT_WARN)
+    lg = _action_btn("◉  TOGGLE LOG", ACCENT_PRP)
     mn.setToolTip("temp_manu <id>")
-    lg.setToolTip("c")
+    lg.setToolTip("c — toggle NTC log")
     mn.clicked.connect(lambda: _cmd_manu(parent))
     lg.clicked.connect(lambda: _cmd_toggle_log(parent))
     r2.addWidget(mn)
@@ -571,31 +558,24 @@ def _build_run_section(parent) -> QGroupBox:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_response_box(parent) -> QGroupBox:
-    grp = QGroupBox("FIRMWARE  RESPONSE")
+    grp = _grp("FIRMWARE  RESPONSE")
     lay = QVBoxLayout()
-    lay.setContentsMargins(6, 6, 6, 6)
+    lay.setContentsMargins(8, 8, 8, 8)
 
     parent.tc_response_box = QTextEdit()
     parent.tc_response_box.setReadOnly(True)
-    parent.tc_response_box.setFixedHeight(130)
+    parent.tc_response_box.setFixedHeight(140)
     parent.tc_response_box.setStyleSheet(f"""
         QTextEdit {{
-            background-color: {BG_SURFACE}; border: 1px solid {BORDER};
-            border-radius: 6px; color: #8FBCD4;
-            font-family: "Cascadia Code", "Consolas", monospace;
-            font-size: 10px; padding: 4px;
+            background-color:{BG_CARD}; border:1px solid {BORDER};
+            border-radius:6px; color:{TEXT_SEC};
+            font-family:"Cascadia Code","Consolas",monospace;
+            font-size:11px; padding:6px;
         }}
     """)
-
     hdr = QHBoxLayout()
     hdr.addStretch()
-    cb = QPushButton("Clear")
-    cb.setFixedHeight(22)
-    cb.setStyleSheet(
-        f"QPushButton {{ background:transparent; border:none; "
-        f"color:{TEXT_DIM}; font-size:10px; }}"
-        f"QPushButton:hover {{ color:{ACCENT_ERR}; }}"
-    )
+    cb = _text_btn("Clear", TEXT_DIM, hover=ACCENT_ERR)
     cb.clicked.connect(lambda: parent.tc_response_box.clear())
     hdr.addWidget(cb)
     lay.addLayout(hdr)
@@ -605,16 +585,14 @@ def _build_response_box(parent) -> QGroupBox:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# REALTIME UPDATE  —  gọi từ protocol_parser sau mỗi dòng PID
+# REALTIME UPDATE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def update_pid_display(parent):
     import global_var
-
     try:
         if hasattr(parent, "pid_step_badge"):
             parent.pid_step_badge.set_step(global_var.pid_step)
-
         if hasattr(parent, "pid_card_sp"):
             parent.pid_card_sp.set_value(global_var.pid_sp)
         if hasattr(parent, "pid_card_pv"):
@@ -626,16 +604,29 @@ def update_pid_display(parent):
             accent = ACCENT_ERR if abs(err) > 5.0 else ACCENT_WARN
             parent.pid_card_err.set_value(err, accent_override=accent)
 
-        # ── graph update (numpy arrays) ───────────────────────────────────
         if hasattr(parent, "pid_curve_pv") and global_var.pid_pv_history:
-            xs  = np.arange(len(global_var.pid_pv_history), dtype=float)
-            pv  = np.array(global_var.pid_pv_history,  dtype=float)
-            sp  = np.array(global_var.pid_sp_history,  dtype=float)
-            err = np.array(global_var.pid_err_history, dtype=float)
+            n_samples = len(global_var.pid_pv_history)
+            xs = np.arange(n_samples, dtype=float)
 
-            parent.pid_curve_pv.setData(xs, pv)
-            parent.pid_curve_sp.setData(xs, sp)
-            parent.pid_curve_err.setData(xs, err)
+            # PV curve
+            parent.pid_curve_pv.setData(
+                xs, np.array(global_var.pid_pv_history, dtype=float)
+            )
+
+            # TARGET: reveal 1 điểm từ lookup mỗi khi có sample PV mới
+            # Đường target kéo dài đúng theo thời gian thực
+            lookup = getattr(global_var, "pid_target_lookup", [])
+            if lookup:
+                n_target = len(global_var.pid_target_history)
+                while n_target < n_samples and n_target < len(lookup):
+                    global_var.pid_target_history.append(lookup[n_target])
+                    n_target += 1
+
+            if global_var.pid_target_history:
+                xt = np.arange(len(global_var.pid_target_history), dtype=float)
+                parent.pid_curve_target.setData(
+                    xt, np.array(global_var.pid_target_history, dtype=float)
+                )
 
     except Exception as e:
         print("PID display error:", e)
@@ -643,98 +634,140 @@ def update_pid_display(parent):
 
 def _clear_pid_history(parent):
     import global_var
-    global_var.pid_pv_history.clear()
-    global_var.pid_sp_history.clear()
-    global_var.pid_err_history.clear()
+    for lst in (global_var.pid_pv_history, global_var.pid_sp_history,
+                global_var.pid_err_history, global_var.pid_target_history):
+        lst.clear()
+    global_var.pid_target_lookup = []
     if hasattr(parent, "pid_curve_pv"):
         empty = np.array([], dtype=float)
         parent.pid_curve_pv.setData(empty, empty)
-        parent.pid_curve_sp.setData(empty, empty)
-        parent.pid_curve_err.setData(empty, empty)
+        parent.pid_curve_target.setData(empty, empty)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# WIZARD AUTO-SEND  —  gửi tuần tự theo flow firmware
+# TARGET PROFILE BUILDER
+#
+# Cơ chế 2 bước:
+#   1. build_target_profile() khi nhấn START:
+#      → tạo lookup table đầy đủ (pid_target_lookup)
+#      → reset pid_target_history = []
+#
+#   2. Mỗi sample PID nhận được, update_pid_display() reveal thêm 1 điểm
+#      từ lookup vào pid_target_history
+#      → target kéo dài đúng theo thời gian thực, không vẽ sẵn
+#
+# Hình dạng target (bậc thang):
+#   step[0]: stop=30°C, dur=60s  →  [30.0] * 60 samples
+#   step[1]: stop=30°C, dur=60s  →  [30.0] * 60 samples
+#   step[2]: stop=27°C, dur=60s  →  [27.0] * 60 samples
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _cmd_send_wizard(parent):
+def build_target_profile(parent):
     """
-    Gửi toàn bộ profile wizard tự động với delay 150ms giữa mỗi dòng.
+    Gọi khi nhấn AUTO START.
+    Tạo lookup table, reset history về rỗng.
+    Target sẽ được reveal từng điểm theo sample PV thực tế nhận được.
+    """
+    import global_var
 
-    Flow gửi (khớp với firmware log):
-      temp_profile_set <id>
-      y                          ← confirm continue
-      <profile_id>               ← firmware hỏi profile index
-      <main_ntc>
-      <sec_ntc>
-      <tec_mask>                 ← hex string, e.g. 0x01
-      <heater_mask>
-      <setpoint*100>             ← int, e.g. 2500 = 25.00°C
-      <delta*100>
-      <step_count>
-      <start*100> <stop*100> <dur> <mode>   ← 1 dòng mỗi step
-      y                          ← save
-    """
+    global_var.pid_target_history.clear()
+
+    lookup = []
+    n = parent.wiz_step_count.value()
+    for i in range(n):
+        start_w, stop_w, dur_w, _ = parent._wiz_steps[i]
+        stop_temp = stop_w.value()
+        dur       = max(int(dur_w.value()), 1)
+        lookup.extend([stop_temp] * dur)
+
+    global_var.pid_target_lookup = lookup
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WIZARD BUILD SEQUENCE
+# Format step: "start_*100  stop_*100  duration  mode"  (4 số)
+# mode: 0=SOAK  1=HEAT  2=COOL  — tự tính từ start/stop
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_wizard_seq(parent) -> list:
     pid    = parent.wiz_profile_id.value()
     n_step = parent.wiz_step_count.value()
 
-    # Build sequence
     seq = []
-    seq.append(f"temp_profile_set {pid}")
-    seq.append("y")                               # confirm continue
-    seq.append(str(pid))                          # profile index
+    seq.append(f"temp_profile_set {pid}")   # [0] lệnh mở đầu
+
+    seq.append("y")                          # confirm continue
+    seq.append(str(pid))                     # profile index
     seq.append(str(parent.wiz_main_ntc.value()))
     seq.append(str(parent.wiz_sec_ntc.value()))
-
-    # hex mask — firmware nhận decimal hoặc hex đều được
-    tec_raw    = parent.wiz_tec_mask.text().strip()    or "1"
-    heater_raw = parent.wiz_heater_mask.text().strip() or "2"
-    seq.append(tec_raw)
-    seq.append(heater_raw)
-
-    # setpoint & delta *100  (firmware: "| -> setpoint (0.01*C): 2500")
+    seq.append(parent.wiz_tec_mask.text().strip()    or "1")
+    seq.append(parent.wiz_heater_mask.text().strip() or "2")
     seq.append(str(int(round(parent.wiz_setpoint.value() * 100))))
     seq.append(str(int(round(parent.wiz_delta.value()    * 100))))
-
     seq.append(str(n_step))
 
-    # Steps
     for i in range(n_step):
-        start_w, stop_w, dur_w, mode_w = parent._wiz_steps[i]
-        start_v = int(round(start_w.value() * 100))
-        stop_v  = int(round(stop_w.value()  * 100))
-        dur_v   = dur_w.value()
-        mode_v  = mode_w.currentIndex()           # 0=SOAK, 1=HEAT, 2=COOL
-        seq.append(f"{start_v} {stop_v} {dur_v} {mode_v}")
+        start_w, stop_w, dur_w, _ = parent._wiz_steps[i]
+        sv = int(round(start_w.value() * 100))
+        ev = int(round(stop_w.value()  * 100))
+        dv = int(dur_w.value())
 
-    seq.append("y")                               # save
+        # Tự tính mode từ start/stop — khớp đúng badge hiển thị trên UI
+        s, e = start_w.value(), stop_w.value()
+        if e > s:   mv = 1   # HEAT
+        elif e < s: mv = 2   # COOL
+        else:       mv = 0   # SOAK
 
-    # Log preview
-    _log_resp(parent, f"[WIZ] Sending {len(seq)} lines for profile {pid}:")
-    for line in seq:
-        _log_resp(parent, f"  > {line}")
+        # Format: start stop duration mode  (4 số, đúng firmware format)
+        seq.append(f"{sv} {ev} {dv} {mv}")
 
-    # Send with 200ms delay between lines
-    _send_sequence(parent, seq, delay_ms=200)
-
-
-def _send_sequence(parent, seq: list, delay_ms: int = 200):
-    """Gửi list lệnh tuần tự, mỗi lệnh cách nhau delay_ms."""
-    if not seq:
-        return
-
-    cmd = seq[0]
-    rest = seq[1:]
-
-    _send(parent, cmd)
-
-    if rest:
-        QTimer.singleShot(delay_ms, lambda: _send_sequence(parent, rest, delay_ms))
+    seq.append("y")   # save
+    return seq
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COMMAND HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _cmd_send_wizard(parent):
+    if parent._wizard_sm and parent._wizard_sm.is_active():
+        _log_resp(parent, "[WIZ] Already running — click CANCEL first")
+        return
+
+    seq = _build_wizard_seq(parent)
+    _log_resp(parent, f"[WIZ] Sequence ({len(seq)} lines):")
+    for i, l in enumerate(seq):
+        _log_resp(parent, f"  [{i}] {l}")
+
+    sm = WizardStateMachine(parent, seq)
+    parent._wizard_sm = sm
+    sm.finished.connect(lambda ok, msg: _on_wizard_finished(parent, ok, msg))
+
+    parent._wiz_send_btn.setEnabled(False)
+    parent._wiz_cancel_btn.setVisible(True)
+    parent.wiz_status_lbl.setText("⏳  Wizard running…")
+    parent.wiz_status_lbl.setStyleSheet(
+        f"color:{ACCENT_WARN};font-size:11px;font-style:italic;background:transparent;"
+    )
+    sm.start()
+
+
+def _cmd_cancel_wizard(parent):
+    if parent._wizard_sm:
+        parent._wizard_sm.cancel()
+    _on_wizard_finished(parent, False, "Cancelled by user")
+
+
+def _on_wizard_finished(parent, ok, msg):
+    parent._wiz_send_btn.setEnabled(True)
+    parent._wiz_cancel_btn.setVisible(False)
+    color = ACCENT_TEAL if ok else ACCENT_ERR
+    icon  = "✓" if ok else "✗"
+    parent.wiz_status_lbl.setText(f"{icon}  {msg}")
+    parent.wiz_status_lbl.setStyleSheet(
+        f"color:{color};font-size:11px;font-style:italic;background:transparent;"
+    )
+
 
 def _cmd_wizard_send(parent):
     text = parent.tc_wizard_input.text().strip()
@@ -743,30 +776,38 @@ def _cmd_wizard_send(parent):
     _send(parent, text)
     parent.tc_wizard_input.clear()
 
+
 def _cmd_pid_get(parent):
     _send(parent, f"temp_auto_pid_get {parent.tc_pid_state.value()}")
 
+
 def _cmd_pid_set(parent):
     sid = parent.tc_pid_state.value()
-    kp  = parent.tc_kp.value()
-    ki  = parent.tc_ki.value()
-    kd  = parent.tc_kd.value()
-    _send(parent, f"temp_auto_pid_set {sid} {kp:.2f} {ki:.2f} {kd:.2f}")
+    _send(parent,
+          f"temp_auto_pid_set {sid} "
+          f"{parent.tc_kp.value():.2f} "
+          f"{parent.tc_ki.value():.2f} "
+          f"{parent.tc_kd.value():.2f}")
+
 
 def _cmd_auto_ena(parent):
     pid = parent.tc_run_profile_id.value()
     _send(parent, f"temp_auto_ena {pid}")
     _log_resp(parent, f"[UI] Auto ENA → profile {pid}")
 
+
 def _cmd_auto_start(parent):
     pid = parent.tc_run_profile_id.value()
     _send(parent, f"temp_auto_start {pid}")
+    build_target_profile(parent)   # vẽ đường target
     _log_resp(parent, f"[UI] Auto START → profile {pid}")
+
 
 def _cmd_manu(parent):
     pid = parent.tc_run_profile_id.value()
     _send(parent, f"temp_manu {pid}")
-    _log_resp(parent, f"[UI] Manual mode → profile {pid}")
+    _log_resp(parent, f"[UI] Manual → profile {pid}")
+
 
 def _cmd_toggle_log(parent):
     _send(parent, "c")
@@ -784,14 +825,18 @@ def _send(parent, cmd: str):
     else:
         _log_resp(parent, "  [ERR] Not connected")
 
+
 def _log_resp(parent, msg: str):
     if hasattr(parent, "tc_response_box"):
         parent.tc_response_box.append(msg)
 
+
 def pipe_to_response(parent, line: str):
-    """Pipe mọi dòng UART → response box (gọi từ protocol_parser)."""
+    """Pipe UART line → response box + feed wizard. Gọi từ protocol_parser."""
     if hasattr(parent, "tc_response_box"):
         parent.tc_response_box.append(f"  {line}")
+    if hasattr(parent, "_wizard_sm") and parent._wizard_sm:
+        parent._wizard_sm.feed_line(line)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -802,20 +847,20 @@ class _StepBadge(QLabel):
     def __init__(self):
         super().__init__()
         self.setAlignment(Qt.AlignCenter)
-        self.setFixedHeight(32)
+        self.setFixedHeight(38)
         self.set_step("NONE")
 
     def set_step(self, step: str):
-        su = step.upper()
+        su  = step.upper().split(":")[0]
         bg, fg = STEP_COLORS.get(su, STEP_COLORS["NONE"])
         sym = {"HEAT": "▲", "COOL": "▼", "SOAK": "◆"}.get(su, "·")
-        self.setText(f"  {sym}  STEP : {su}  {sym}  ")
+        self.setText(f"  {sym}    STEP :  {step.upper()}    {sym}  ")
         self.setStyleSheet(f"""
             QLabel {{
-                background-color: {bg}; border: 1px solid {fg}55;
-                border-radius: 6px; color: {fg};
-                font-family: "Cascadia Code","Consolas",monospace;
-                font-size: 12px; font-weight: 700; letter-spacing: 3px;
+                background-color:{bg}; border:1.5px solid {fg}66;
+                border-radius:8px; color:{fg};
+                font-family:"Cascadia Code","Consolas",monospace;
+                font-size:14px; font-weight:800; letter-spacing:4px;
             }}
         """)
 
@@ -827,28 +872,28 @@ class _MetricCard(QFrame):
         self._unit   = unit
         self.setStyleSheet(f"""
             QFrame {{
-                background-color: {BG_SURFACE}; border: 1px solid {BORDER};
-                border-radius: 8px;
+                background-color:{BG_CARD}; border:1.5px solid {BORDER};
+                border-radius:10px;
             }}
         """)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setFixedHeight(62)
+        self.setFixedHeight(72)
 
         lay = QVBoxLayout(self)
         lay.setSpacing(2)
-        lay.setContentsMargins(6, 5, 6, 5)
+        lay.setContentsMargins(8, 6, 8, 6)
 
         self._lbl_w = QLabel(label)
         self._lbl_w.setAlignment(Qt.AlignCenter)
         self._lbl_w.setStyleSheet(
-            f"color:{TEXT_SEC}; font-size:10px; letter-spacing:1px;"
-            f" background:transparent; border:none;"
+            f"color:{TEXT_DIM};font-size:10px;font-weight:700;"
+            f"letter-spacing:1.5px;background:transparent;border:none;"
         )
         self._val_w = QLabel("—")
         self._val_w.setAlignment(Qt.AlignCenter)
         self._val_w.setStyleSheet(
-            f"color:{accent}; font-size:15px; font-weight:700;"
-            f" background:transparent; border:none;"
+            f"color:{accent};font-size:18px;font-weight:800;"
+            f"background:transparent;border:none;"
         )
         lay.addWidget(self._lbl_w)
         lay.addWidget(self._val_w)
@@ -857,8 +902,8 @@ class _MetricCard(QFrame):
         accent = accent_override or self._accent
         self._val_w.setText(f"{value:+.2f} {self._unit}")
         self._val_w.setStyleSheet(
-            f"color:{accent}; font-size:15px; font-weight:700;"
-            f" background:transparent; border:none;"
+            f"color:{accent};font-size:18px;font-weight:800;"
+            f"background:transparent;border:none;"
         )
 
 
@@ -866,100 +911,163 @@ class _MetricCard(QFrame):
 # STYLE HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _btn(label: str, accent: str) -> QPushButton:
-    b = QPushButton(label)
-    b.setFixedHeight(30)
-    b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-    b.setStyleSheet(f"""
-        QPushButton {{
-            background-color:{accent}18; border:1px solid {accent}55;
-            border-radius:6px; color:{accent};
-            font-size:11px; font-weight:700; letter-spacing:0.8px;
+def _grp(title: str) -> QGroupBox:
+    g = QGroupBox(title)
+    g.setStyleSheet(f"""
+        QGroupBox {{
+            background-color:{BG_SURFACE}; border:1.5px solid {BORDER};
+            border-radius:10px; margin-top:20px;
+            padding:8px 8px 8px 8px;
         }}
-        QPushButton:hover {{ background-color:{accent}30; border-color:{accent}; }}
-        QPushButton:pressed {{ background-color:{accent}10; }}
+        QGroupBox::title {{
+            subcontrol-origin:margin; subcontrol-position:top left;
+            left:12px; top:3px;
+            color:{ACCENT_CYAN}; font-size:11px; font-weight:800;
+            letter-spacing:2px;
+        }}
+    """)
+    return g
+
+
+def _action_btn(label, accent, h=34, w=None, bold=False):
+    b = QPushButton(label)
+    b.setFixedHeight(h)
+    if w:
+        b.setFixedWidth(w)
+    else:
+        b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    fw = "800" if bold else "700"
+    b.setStyleSheet(f"""
+        QPushButton{{
+            background-color:{accent}20;border:1.5px solid {accent}66;
+            border-radius:7px;color:{accent};
+            font-size:12px;font-weight:{fw};letter-spacing:0.8px;
+        }}
+        QPushButton:hover{{background-color:{accent}38;border-color:{accent};}}
+        QPushButton:pressed{{background-color:{accent}12;}}
+        QPushButton:disabled{{background-color:{accent}08;border-color:{BORDER};
+            color:{TEXT_DIM};}}
     """)
     return b
 
-def _small_btn(label: str, accent: str) -> QPushButton:
+
+def _text_btn(label, color, hover):
     b = QPushButton(label)
-    b.setFixedHeight(26)
-    b.setStyleSheet(f"""
-        QPushButton {{
-            background-color:{accent}12; border:1px solid {accent}44;
-            border-radius:5px; color:{accent};
-            font-size:10px; font-weight:600; padding: 0 8px;
-        }}
-        QPushButton:hover {{ background-color:{accent}25; border-color:{accent}; }}
-    """)
+    b.setFixedHeight(22)
+    b.setStyleSheet(
+        f"QPushButton{{background:transparent;border:none;"
+        f"color:{color};font-size:10px;}}"
+        f"QPushButton:hover{{color:{hover};}}"
+    )
     return b
 
-def _icon_btn(icon: str, accent: str) -> QPushButton:
+
+def _icon_btn(icon, accent):
     b = QPushButton(icon)
-    b.setFixedSize(28, 28)
+    b.setFixedSize(30, 30)
     b.setStyleSheet(f"""
-        QPushButton {{
-            background-color:{BG_SURFACE}; border:1px solid {BORDER};
-            border-radius:6px; color:{accent};
-            font-size:14px; font-weight:700;
-        }}
-        QPushButton:hover {{ background-color:#1C2540; border-color:{accent}; }}
+        QPushButton{{background-color:{BG_CARD};border:1.5px solid {BORDER};
+            border-radius:6px;color:{accent};font-size:15px;font-weight:800;}}
+        QPushButton:hover{{background-color:#1C2540;border-color:{accent};}}
     """)
     return b
 
-def _lbl(text: str) -> QLabel:
-    l = QLabel(text)
-    l.setStyleSheet(f"color:{TEXT_SEC}; font-size:11px;")
-    return l
 
-def _section_lbl(text: str) -> QLabel:
+def _lbl(text, bold=False):
     l = QLabel(text)
+    fw = "700" if bold else "500"
     l.setStyleSheet(
-        f"color:{ACCENT_CYAN}; font-size:10px; font-weight:600; "
-        f"letter-spacing:1px; background:transparent;"
+        f"color:{TEXT_SEC};font-size:12px;font-weight:{fw};"
+        f"background:transparent;"
     )
     return l
 
-def _hline() -> QFrame:
+
+def _section_lbl(text):
+    l = QLabel(text)
+    l.setStyleSheet(
+        f"color:{ACCENT_CYAN};font-size:11px;font-weight:700;"
+        f"letter-spacing:1px;background:transparent;"
+    )
+    return l
+
+
+def _hline():
     f = QFrame()
     f.setFrameShape(QFrame.HLine)
-    f.setStyleSheet(f"background:{BORDER}; max-height:1px; border:none;")
+    f.setStyleSheet(f"background:{BORDER};max-height:1px;border:none;")
     return f
 
-def _spinbox_style() -> str:
+
+def _spinbox(lo, hi, default, tip="", w=None):
+    s = QSpinBox()
+    s.setRange(lo, hi)
+    s.setValue(default)
+    s.setFixedHeight(30)
+    if w:
+        s.setFixedWidth(w)
+    if tip:
+        s.setToolTip(tip)
+    s.setStyleSheet(_sb_style())
+    return s
+
+
+def _spinbox2(lo, hi, default, compact=False):
+    s = QSpinBox()
+    s.setRange(lo, hi)
+    s.setValue(default)
+    s.setFixedHeight(26 if compact else 30)
+    s.setStyleSheet(_sb_style(compact))
+    return s
+
+
+def _dspinbox(lo, hi, default, tip="", compact=False):
+    s = QDoubleSpinBox()
+    s.setRange(lo, hi)
+    s.setValue(default)
+    s.setDecimals(2)
+    s.setSingleStep(1.0)
+    s.setFixedHeight(26 if compact else 30)
+    if tip:
+        s.setToolTip(tip)
+    s.setStyleSheet(_sb_style(compact))
+    return s
+
+
+def _lineedit(default, tip="", w=None):
+    e = QLineEdit(default)
+    if tip:
+        e.setToolTip(tip)
+    e.setFixedHeight(30)
+    if w:
+        e.setFixedWidth(w)
+    e.setStyleSheet(_input_style())
+    return e
+
+
+def _sb_style(compact=False):
+    fs = "10px" if compact else "12px"
     return f"""
-        QSpinBox, QDoubleSpinBox {{
-            background:{BG_SURFACE}; border:1px solid {BORDER};
-            border-radius:6px; color:{ACCENT_CYAN};
-            font-size:12px; font-weight:600; padding:2px 6px;
+        QSpinBox,QDoubleSpinBox{{
+            background:{BG_CARD};border:1.5px solid {BORDER};
+            border-radius:6px;color:{TEXT_PRIM};
+            font-size:{fs};font-weight:600;padding:2px 6px;
         }}
-        QSpinBox:focus, QDoubleSpinBox:focus {{ border-color:{ACCENT_CYAN}; }}
-        QSpinBox::up-button, QDoubleSpinBox::up-button,
-        QSpinBox::down-button, QDoubleSpinBox::down-button {{
-            width:16px; border:none; background:transparent;
+        QSpinBox:focus,QDoubleSpinBox:focus{{border-color:{ACCENT_CYAN};}}
+        QSpinBox::up-button,QDoubleSpinBox::up-button,
+        QSpinBox::down-button,QDoubleSpinBox::down-button{{
+            width:14px;border:none;background:transparent;
         }}
     """
 
-def _spinbox_style_compact() -> str:
-    return f"""
-        QSpinBox, QDoubleSpinBox {{
-            background:{BG_CARD}; border:1px solid {BORDER};
-            border-radius:4px; color:{ACCENT_CYAN};
-            font-size:10px; font-weight:600; padding:1px 4px;
-        }}
-        QSpinBox::up-button, QDoubleSpinBox::up-button,
-        QSpinBox::down-button, QDoubleSpinBox::down-button {{
-            width:12px; border:none; background:transparent;
-        }}
-    """
 
-def _input_style() -> str:
+def _input_style():
     return f"""
-        QLineEdit {{
-            background:{BG_SURFACE}; border:1px solid {BORDER};
-            border-radius:6px; color:{TEXT_PRIM};
+        QLineEdit{{
+            background:{BG_CARD};border:1.5px solid {BORDER};
+            border-radius:6px;color:{TEXT_PRIM};
             font-family:"Cascadia Code","Consolas",monospace;
-            font-size:11px; padding:2px 8px;
+            font-size:11px;padding:2px 8px;
         }}
-        QLineEdit:focus {{ border-color:{ACCENT_CYAN}; }}
+        QLineEdit:focus{{border-color:{ACCENT_CYAN};}}
     """
